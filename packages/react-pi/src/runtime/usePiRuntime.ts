@@ -38,7 +38,7 @@ import {
   type PiInterruptAnswer,
 } from "./hostUi";
 import { createPiThreadState, type PiThreadState } from "./threadState";
-import type { PiClient, PiThreadMetadata } from "../types";
+import type { PiClient, PiThinkingLevel, PiThreadMetadata } from "../types";
 import { piExtras } from "./piExtras";
 import type { PiRuntimeExtrasInternal, PiRuntimeOptions } from "./runtimeTypes";
 import { PI_SDK } from "../sdkIdentity";
@@ -411,11 +411,69 @@ const toOptimisticThreadMessage = (
   content: appendMessageParts(message),
 });
 
+type PendingThreadConfig = {
+  model?: { provider: string; modelId: string };
+  thinkingLevel?: PiThinkingLevel;
+};
+
+const applyThreadConfig = async (
+  controller: PiThreadControllerLike,
+  config: PendingThreadConfig,
+) => {
+  if (config.model) await controller.setModel(config.model);
+  if (config.thinkingLevel)
+    await controller.setThinkingLevel(config.thinkingLevel);
+};
+
+const useNewPiThreadExtras = () => {
+  const [pendingConfig, setPendingConfig] = useState<PendingThreadConfig>();
+  const pendingConfigRef = useRef(pendingConfig);
+
+  const extras = useMemo(() => {
+    const choose = (patch: PendingThreadConfig) => {
+      pendingConfigRef.current = { ...pendingConfigRef.current, ...patch };
+      setPendingConfig(pendingConfigRef.current);
+    };
+    const state: PiThreadState = pendingConfig
+      ? {
+          ...EMPTY_THREAD_STATE,
+          metadata: {
+            ...EMPTY_THREAD_STATE.metadata,
+            config: {
+              ...pendingConfig.model,
+              ...(pendingConfig.thinkingLevel
+                ? { thinkingLevel: pendingConfig.thinkingLevel }
+                : {}),
+            },
+          },
+        }
+      : EMPTY_THREAD_STATE;
+    const controller: PiThreadControllerLike = {
+      ...NOOP_CONTROLLER,
+      getState: () => state,
+      setModel: async ({ provider, modelId }) => {
+        choose({ model: { provider, modelId } });
+      },
+      setThinkingLevel: async (thinkingLevel) => {
+        choose({ thinkingLevel });
+      },
+    };
+    return buildExtras(controller, state);
+  }, [pendingConfig]);
+
+  return { extras, pendingConfigRef };
+};
+
 const useNewPiThreadStore = (
   registry: PiControllerRegistry,
   options: PiRuntimeOptions,
 ): ExternalStoreAdapter<ThreadMessage> => {
   const aui = useAui();
+  const { extras, pendingConfigRef } = useNewPiThreadExtras();
+  const appliedConfigRef = useRef<{
+    threadId: string;
+    applied: Promise<void>;
+  }>(undefined);
   const {
     adapters,
     cloud,
@@ -443,7 +501,7 @@ const useNewPiThreadStore = (
       isLoading: false,
       isRunning: false,
       messageRepository: optimisticRepository,
-      extras: EMPTY_RUNTIME_EXTRAS,
+      extras,
       ...(adapters ? { adapters } : {}),
       onNew: async (message) => {
         const optimistic = toOptimisticThreadMessage(
@@ -462,11 +520,28 @@ const useNewPiThreadStore = (
           // deliver the message to the live thread.
           const { remoteId, externalId } =
             await aui.threadListItem.initialize();
+          const piThreadId = cloud ? externalId : (externalId ?? remoteId);
+          const pendingConfig = pendingConfigRef.current;
+          if (piThreadId && pendingConfig && !registry.disposed) {
+            // A choice failing to apply must not drop the message; the live
+            // thread then shows the configuration it actually runs with.
+            if (appliedConfigRef.current?.threadId !== piThreadId) {
+              appliedConfigRef.current = {
+                threadId: piThreadId,
+                applied: applyThreadConfig(
+                  getController(registry, piThreadId),
+                  pendingConfig,
+                ).catch((error: unknown) =>
+                  invokePiErrorCallback(onError, error),
+                ),
+              };
+            }
+            await appliedConfigRef.current.applied;
+          }
           if (registry.disposed) {
             removeOptimisticMessage();
             return;
           }
-          const piThreadId = cloud ? externalId : (externalId ?? remoteId);
           if (!piThreadId) {
             throw new Error("This thread has no Pi thread to send to.");
           }
@@ -483,6 +558,8 @@ const useNewPiThreadStore = (
     }),
     [
       aui,
+      extras,
+      pendingConfigRef,
       optimisticRepository,
       registry,
       adapters,
