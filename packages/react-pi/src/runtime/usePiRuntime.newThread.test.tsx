@@ -13,6 +13,8 @@ import type { PiClient, PiThreadSnapshot } from "../types";
 const mocks = vi.hoisted(() => ({
   adapters: [] as unknown[],
   sendMessage: vi.fn().mockResolvedValue(undefined),
+  setModel: vi.fn().mockResolvedValue(undefined),
+  setThinkingLevel: vi.fn().mockResolvedValue(undefined),
 }));
 
 vi.mock("@assistant-ui/react", async (importOriginal) => {
@@ -47,8 +49,8 @@ vi.mock("./ThreadController", async (importOriginal) => {
     sendMessage = mocks.sendMessage;
     cancel = vi.fn().mockResolvedValue(undefined);
     clearQueue = vi.fn().mockResolvedValue({ steering: [], followUp: [] });
-    setModel = vi.fn().mockResolvedValue(undefined);
-    setThinkingLevel = vi.fn().mockResolvedValue(undefined);
+    setModel = mocks.setModel;
+    setThinkingLevel = mocks.setThinkingLevel;
     respondToToolApproval = vi.fn().mockResolvedValue(undefined);
     resumeToolCall = vi.fn().mockResolvedValue(undefined);
     respondToHostUiRequest = vi.fn().mockResolvedValue(undefined);
@@ -59,6 +61,8 @@ vi.mock("./ThreadController", async (importOriginal) => {
 });
 
 import { createPiThreadState } from "./threadState";
+import { usePiRuntimeExtras } from "./hooks";
+import type { PiRuntimeExtras } from "./runtimeTypes";
 import { usePiRuntime } from "./usePiRuntime";
 
 (
@@ -237,5 +241,107 @@ describe("usePiRuntime new-thread first message", () => {
 
     expect(mocks.sendMessage).toHaveBeenCalledOnce();
     expect(sentTexts()).toEqual(["strict mode message"]);
+  });
+});
+
+describe("usePiRuntime new-thread model choice", () => {
+  const renderWithExtras = async (
+    client: PiClient,
+    onError?: (error: unknown) => void,
+  ) => {
+    let runtime!: AssistantRuntime;
+    const extras: { current?: PiRuntimeExtras } = {};
+
+    const Extras = () => {
+      extras.current = usePiRuntimeExtras();
+      return null;
+    };
+    const Harness = () => {
+      runtime = usePiRuntime({ client, ...(onError ? { onError } : {}) });
+      return createElement(
+        AssistantRuntimeProvider,
+        { runtime },
+        createElement(Extras),
+      );
+    };
+
+    root = createRoot(document.createElement("div"));
+    await act(async () => {
+      root!.render(createElement(Harness));
+    });
+    await act(async () => {});
+    return { runtime: () => runtime, extras: () => extras.current! };
+  };
+
+  it("shows the model and thinking level chosen before the first message", async () => {
+    const { client } = createClient();
+    const { extras } = await renderWithExtras(client);
+
+    await act(async () => {
+      await extras().setModel({ provider: "anthropic", modelId: "opus" });
+      await extras().setThinkingLevel("high");
+    });
+
+    expect(extras().metadata.config).toEqual({
+      provider: "anthropic",
+      modelId: "opus",
+      thinkingLevel: "high",
+    });
+  });
+
+  it("applies the choice to the new thread before sending the first message", async () => {
+    const sessionCreate = Promise.withResolvers<PiThreadSnapshot>();
+    const { client } = createClient(() => sessionCreate.promise);
+    const { runtime, extras } = await renderWithExtras(client);
+
+    await act(async () => {
+      await extras().setModel({ provider: "anthropic", modelId: "opus" });
+      await extras().setThinkingLevel("high");
+    });
+
+    const modelApplied = Promise.withResolvers<void>();
+    mocks.setModel.mockReturnValueOnce(modelApplied.promise);
+
+    let send!: Promise<void> | void;
+    await act(async () => {
+      send = runtime().thread.append("first message");
+    });
+    await act(async () => {
+      sessionCreate.resolve(snapshot);
+    });
+    await vi.waitFor(() => expect(mocks.setModel).toHaveBeenCalledOnce());
+
+    expect(mocks.setModel).toHaveBeenCalledWith({
+      provider: "anthropic",
+      modelId: "opus",
+    });
+    expect(mocks.sendMessage).not.toHaveBeenCalled();
+
+    await act(async () => {
+      modelApplied.resolve();
+      await send;
+    });
+
+    expect(mocks.setThinkingLevel).toHaveBeenCalledWith("high");
+    expect(sentTexts()).toEqual(["first message"]);
+  });
+
+  it("still sends the first message and reports the error when the choice fails to apply", async () => {
+    const { client } = createClient();
+    const onError = vi.fn();
+    const { runtime, extras } = await renderWithExtras(client, onError);
+
+    await act(async () => {
+      await extras().setModel({ provider: "anthropic", modelId: "opus" });
+    });
+    const failure = new Error("model unavailable");
+    mocks.setModel.mockRejectedValueOnce(failure);
+
+    await act(async () => {
+      await runtime().thread.append("first message");
+    });
+
+    expect(onError).toHaveBeenCalledWith(failure);
+    expect(sentTexts()).toEqual(["first message"]);
   });
 });
